@@ -3,13 +3,59 @@ use crate::storage::Storage;
 use crate::errors::ContractError;
 use crate::event::Events;
 use crate::dao::DAOContract;
+use crate::types::Role;
 
 pub struct TreasuryContract;
 
 impl TreasuryContract {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Token Whitelist management
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Whitelist a token so it can be deposited into this DAO's treasury.
+    /// Requires Admin role.
+    pub fn add_token(
+        env: &Env,
+        dao_id: u64,
+        caller: Address,
+        token_address: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        DAOContract::require_role(env, dao_id, &caller, &Role::Admin)?;
+
+        let slot = Self::token_slot(env, &token_address);
+        Storage::whitelist_token(env, dao_id, slot);
+        Events::token_whitelisted(env, dao_id, &token_address);
+        Ok(())
+    }
+
+    /// Remove a token from the whitelist. Requires Admin role.
+    pub fn remove_token(
+        env: &Env,
+        dao_id: u64,
+        caller: Address,
+        token_address: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        DAOContract::require_role(env, dao_id, &caller, &Role::Admin)?;
+
+        let slot = Self::token_slot(env, &token_address);
+        Storage::remove_whitelisted_token(env, dao_id, slot);
+        Events::token_removed(env, dao_id, &token_address);
+        Ok(())
+    }
+
+    pub fn is_whitelisted(env: &Env, dao_id: u64, token_address: Address) -> bool {
+        let slot = Self::token_slot(env, &token_address);
+        Storage::is_token_whitelisted(env, dao_id, slot)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Deposits and Withdrawals
+    // ─────────────────────────────────────────────────────────────────────────
+
     /// Deposit tokens into the DAO treasury.
-    ///
-    /// The caller must have pre-authorised the transfer (standard SEP-41 flow).
+    /// Token must be whitelisted. Any address may deposit (open to contributors).
     pub fn deposit(
         env: &Env,
         dao_id: u64,
@@ -24,12 +70,14 @@ impl TreasuryContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        // Transfer from caller → contract
+        let slot = Self::token_slot(env, &token_address);
+        if !Storage::is_token_whitelisted(env, dao_id, slot) {
+            return Err(ContractError::TokenNotWhitelisted);
+        }
+
         token::Client::new(env, &token_address)
             .transfer(&from, &env.current_contract_address(), &amount);
 
-        // Update internal book-keeping
-        let slot = Self::token_slot(env, &token_address);
         let balance = Storage::get_treasury_balance(env, dao_id, slot);
         Storage::set_treasury_balance(env, dao_id, slot, balance + amount);
 
@@ -37,23 +85,29 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Withdraw tokens from the DAO treasury. Only the DAO admin may call.
+    /// Withdraw tokens from the DAO treasury.
+    /// Requires Treasurer or Admin role.
     pub fn withdraw(
         env: &Env,
         dao_id: u64,
         token_address: Address,
-        admin: Address,
+        caller: Address,
         to: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
-        admin.require_auth();
-        DAOContract::require_admin(env, dao_id, &admin)?;
+        caller.require_auth();
+        DAOContract::require_active(env, dao_id)?;
+        DAOContract::require_role(env, dao_id, &caller, &Role::Treasurer)?;
 
         if amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
 
         let slot = Self::token_slot(env, &token_address);
+        if !Storage::is_token_whitelisted(env, dao_id, slot) {
+            return Err(ContractError::TokenNotWhitelisted);
+        }
+
         let balance = Storage::get_treasury_balance(env, dao_id, slot);
         if balance < amount {
             return Err(ContractError::InsufficientBalance);
@@ -63,15 +117,14 @@ impl TreasuryContract {
             .transfer(&env.current_contract_address(), &to, &amount);
 
         Storage::set_treasury_balance(env, dao_id, slot, balance - amount);
-
         Events::treasury_withdraw(env, dao_id, &token_address, amount);
         Ok(())
     }
 
-    /// Lock a portion of the treasury into a payroll escrow.
-    ///
-    /// Called internally during payroll execution. Not exposed publicly to
-    /// prevent arbitrary locking — only the payroll module calls this.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Budget locking  (called internally by the payroll module only)
+    // ─────────────────────────────────────────────────────────────────────────
+
     pub fn lock_budget(
         env: &Env,
         dao_id: u64,
@@ -99,7 +152,8 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Release locked budget back to the treasury (used when payroll is cancelled).
+    /// Release locked budget back to the free treasury balance.
+    /// Called when an Approved payroll is cancelled before execution.
     pub fn release_budget(
         env: &Env,
         dao_id: u64,
@@ -125,9 +179,7 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Pay an employee directly from locked payroll funds.
-    ///
-    /// Called once per employee during payroll execution or claim.
+    /// Transfer salary from locked escrow directly to an employee wallet.
     pub fn pay_employee(
         env: &Env,
         payroll_id: u64,
@@ -152,33 +204,33 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Available treasury balance for a given token.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Queries
+    // ─────────────────────────────────────────────────────────────────────────
+
     pub fn balance(env: &Env, dao_id: u64, token_address: Address) -> i128 {
         let slot = Self::token_slot(env, &token_address);
         Storage::get_treasury_balance(env, dao_id, slot)
     }
 
-    /// Locked balance for a specific payroll.
     pub fn locked_balance(env: &Env, payroll_id: u64, token_address: Address) -> i128 {
         let slot = Self::token_slot(env, &token_address);
         Storage::get_locked_balance(env, payroll_id, slot)
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal helpers
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Derive a stable u64 "slot" from a token address so we can use it as
-    /// a DataKey component without needing Address in the enum variant.
-    ///
-    /// We use the first 8 bytes of SHA-256(address XDR bytes) for determinism.
-    /// Collision probability across distinct token addresses is negligible.
+    /// Derive a stable u64 slot from a token address via SHA-256 of its XDR.
     pub fn token_slot(env: &Env, token_address: &Address) -> u64 {
         use soroban_sdk::xdr::ToXdr;
         let addr_bytes = token_address.to_xdr(env);
         let hash: soroban_sdk::crypto::Hash<32> = env.crypto().sha256(&addr_bytes);
-        let hash_bytes_n: BytesN<32> = hash.into();
+        let hash_n: BytesN<32> = hash.into();
         let mut slot_bytes = [0u8; 8];
         for i in 0..8u32 {
-            slot_bytes[i as usize] = hash_bytes_n.get(i).unwrap();
+            slot_bytes[i as usize] = hash_n.get(i).unwrap();
         }
         u64::from_be_bytes(slot_bytes)
     }

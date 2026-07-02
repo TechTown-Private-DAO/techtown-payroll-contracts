@@ -1,27 +1,44 @@
 use soroban_sdk::{symbol_short, Address, Env};
 
-/// Emit events using two-topic convention:
-///   topics = (event_name_symbol, primary_id)
-///   data   = remaining fields
-
 pub struct Events;
 
 impl Events {
     // ── DAO ──────────────────────────────────────────────────────────────────
 
     pub fn dao_created(env: &Env, dao_id: u64, admin: &Address) {
-        env.events()
-            .publish((symbol_short!("dao_creat"), dao_id), admin);
+        env.events().publish((symbol_short!("dao_creat"), dao_id), admin);
     }
 
     pub fn dao_paused(env: &Env, dao_id: u64, admin: &Address) {
-        env.events()
-            .publish((symbol_short!("dao_pause"), dao_id), admin);
+        env.events().publish((symbol_short!("dao_pause"), dao_id), admin);
     }
 
     pub fn dao_unpaused(env: &Env, dao_id: u64, admin: &Address) {
-        env.events()
-            .publish((symbol_short!("dao_unpse"), dao_id), admin);
+        env.events().publish((symbol_short!("dao_unpse"), dao_id), admin);
+    }
+
+    // ── Members / Roles ──────────────────────────────────────────────────────
+
+    pub fn member_added(env: &Env, dao_id: u64, member: &Address) {
+        env.events().publish((symbol_short!("mbr_added"), dao_id), member);
+    }
+
+    pub fn member_removed(env: &Env, dao_id: u64, member: &Address) {
+        env.events().publish((symbol_short!("mbr_rmvd"), dao_id), member);
+    }
+
+    pub fn role_updated(env: &Env, dao_id: u64, member: &Address) {
+        env.events().publish((symbol_short!("rol_updt"), dao_id), member);
+    }
+
+    // ── Token Whitelist ───────────────────────────────────────────────────────
+
+    pub fn token_whitelisted(env: &Env, dao_id: u64, token: &Address) {
+        env.events().publish((symbol_short!("tok_whtl"), dao_id), token);
+    }
+
+    pub fn token_removed(env: &Env, dao_id: u64, token: &Address) {
+        env.events().publish((symbol_short!("tok_rmvd"), dao_id), token);
     }
 
     // ── Employee ─────────────────────────────────────────────────────────────
@@ -32,18 +49,15 @@ impl Events {
     }
 
     pub fn employee_removed(env: &Env, dao_id: u64, employee_id: u64) {
-        env.events()
-            .publish((symbol_short!("emp_rmvd"), dao_id), employee_id);
+        env.events().publish((symbol_short!("emp_rmvd"), dao_id), employee_id);
     }
 
     pub fn employee_frozen(env: &Env, dao_id: u64, employee_id: u64) {
-        env.events()
-            .publish((symbol_short!("emp_frzn"), dao_id), employee_id);
+        env.events().publish((symbol_short!("emp_frzn"), dao_id), employee_id);
     }
 
     pub fn employee_activated(env: &Env, dao_id: u64, employee_id: u64) {
-        env.events()
-            .publish((symbol_short!("emp_actv"), dao_id), employee_id);
+        env.events().publish((symbol_short!("emp_actv"), dao_id), employee_id);
     }
 
     pub fn wallet_updated(env: &Env, dao_id: u64, employee_id: u64, new_wallet: &Address) {
@@ -91,8 +105,7 @@ impl Events {
     }
 
     pub fn payroll_cancelled(env: &Env, payroll_id: u64) {
-        env.events()
-            .publish((symbol_short!("pay_cncl"), payroll_id), ());
+        env.events().publish((symbol_short!("pay_cncl"), payroll_id), ());
     }
 
     pub fn salary_claimed(env: &Env, payroll_id: u64, employee_id: u64, amount: i128) {
@@ -113,12 +126,21 @@ impl Events {
     }
 
     pub fn proposal_executed(env: &Env, proposal_id: u64) {
-        env.events()
-            .publish((symbol_short!("prp_exec"), proposal_id), ());
+        env.events().publish((symbol_short!("prp_exec"), proposal_id), ());
     }
 
     pub fn proposal_rejected(env: &Env, proposal_id: u64, admin: &Address) {
         env.events()
             .publish((symbol_short!("prp_rjct"), proposal_id), admin);
+    }
+
+    // ── Upgradeability ────────────────────────────────────────────────────────
+
+    pub fn contract_upgraded(env: &Env, dao_id: u64) {
+        env.events().publish((symbol_short!("upgraded"), dao_id), ());
+    }
+
+    pub fn verifying_key_set(env: &Env, dao_id: u64) {
+        env.events().publish((symbol_short!("vk_set"), dao_id), ());
     }
 }

@@ -1,9 +1,5 @@
 use soroban_sdk::contracterror;
 
-/// All errors that the TechTown Payroll contract can return.
-///
-/// Variants are numbered starting at 1 (0 is reserved by the SDK to mean
-/// "success" in the XDR encoding).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ContractError {
@@ -15,6 +11,10 @@ pub enum ContractError {
     DAONotFound = 3,
     DAOPaused = 12,
     DAONotPaused = 13,
+
+    // ── Member / Roles ───────────────────────────────────────────────────────
+    MemberNotFound = 25,
+    AlreadyMember = 26,
 
     // ── Employee ─────────────────────────────────────────────────────────────
     EmployeeNotFound = 4,
@@ -30,13 +30,15 @@ pub enum ContractError {
     // ── Treasury ─────────────────────────────────────────────────────────────
     InsufficientBalance = 8,
     InvalidAmount = 14,
+    TokenNotWhitelisted = 27,
 
     // ── Payroll ──────────────────────────────────────────────────────────────
     PayrollNotFound = 9,
     PayrollAlreadyExecuted = 10,
     /// Operation requires a different payroll status than current
     PayrollInvalidStatus = 11,
-    PeriodMismatch = 15,
+    /// Employee already paid for this period
+    AlreadyPaidThisPeriod = 15,
     AlreadyClaimed = 24,
 
     // ── Multisig ─────────────────────────────────────────────────────────────

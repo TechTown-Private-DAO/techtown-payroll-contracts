@@ -10,13 +10,13 @@ mod treasury;
 mod payroll;
 mod zk_verifier;
 mod multisig;
+mod upgrade;
 
 #[cfg(test)]
 mod test;
 
 use soroban_sdk::{contract, contractimpl, Address, Bytes, BytesN, Env, String, Vec};
 
-// Re-export types so tests and callers can import them cleanly
 pub use types::*;
 pub use errors::ContractError;
 pub use storage::DataKey;
@@ -70,6 +70,43 @@ impl TechTownPayroll {
 
     pub fn get_dao(env: Env, dao_id: u64) -> Result<DAOConfig, ContractError> {
         dao::DAOContract::get_dao_info(&env, dao_id)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Members / Roles
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn add_member(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        new_member: Address,
+        role: Role,
+    ) -> Result<(), ContractError> {
+        dao::DAOContract::add_member(&env, dao_id, caller, new_member, role)
+    }
+
+    pub fn remove_member(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        member_addr: Address,
+    ) -> Result<(), ContractError> {
+        dao::DAOContract::remove_member(&env, dao_id, caller, member_addr)
+    }
+
+    pub fn update_member_role(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        member_addr: Address,
+        new_role: Role,
+    ) -> Result<(), ContractError> {
+        dao::DAOContract::update_member_role(&env, dao_id, caller, member_addr, new_role)
+    }
+
+    pub fn get_members(env: Env, dao_id: u64) -> Vec<Member> {
+        dao::DAOContract::get_members(&env, dao_id)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -140,11 +177,7 @@ impl TechTownPayroll {
         )
     }
 
-    pub fn get_employee(
-        env: Env,
-        dao_id: u64,
-        employee_id: u64,
-    ) -> Result<Employee, ContractError> {
+    pub fn get_employee(env: Env, dao_id: u64, employee_id: u64) -> Result<Employee, ContractError> {
         employee::EmployeeContract::get_employee(&env, dao_id, employee_id)
     }
 
@@ -153,7 +186,33 @@ impl TechTownPayroll {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Treasury
+    // Treasury — token whitelist
+    // ─────────────────────────────────────────────────────────────────────────
+
+    pub fn add_token(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        token_address: Address,
+    ) -> Result<(), ContractError> {
+        treasury::TreasuryContract::add_token(&env, dao_id, caller, token_address)
+    }
+
+    pub fn remove_token(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        token_address: Address,
+    ) -> Result<(), ContractError> {
+        treasury::TreasuryContract::remove_token(&env, dao_id, caller, token_address)
+    }
+
+    pub fn is_token_whitelisted(env: Env, dao_id: u64, token_address: Address) -> bool {
+        treasury::TreasuryContract::is_whitelisted(&env, dao_id, token_address)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Treasury — balances
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn deposit(
@@ -170,11 +229,11 @@ impl TechTownPayroll {
         env: Env,
         dao_id: u64,
         token_address: Address,
-        admin: Address,
+        caller: Address,
         to: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
-        treasury::TreasuryContract::withdraw(&env, dao_id, token_address, admin, to, amount)
+        treasury::TreasuryContract::withdraw(&env, dao_id, token_address, caller, to, amount)
     }
 
     pub fn treasury_balance(env: Env, dao_id: u64, token_address: Address) -> i128 {
@@ -198,9 +257,11 @@ impl TechTownPayroll {
         commitments: Vec<SalaryCommitment>,
         total_amount: i128,
         merkle_root: BytesN<32>,
+        token_address: Address,
     ) -> Result<u64, ContractError> {
         payroll::PayrollContract::create_payroll(
-            &env, dao_id, admin, period, employees, commitments, total_amount, merkle_root,
+            &env, dao_id, admin, period, employees, commitments,
+            total_amount, merkle_root, token_address,
         )
     }
 
@@ -230,12 +291,14 @@ impl TechTownPayroll {
         employee_id: u64,
         token_address: Address,
         amount: i128,
+        salary: i128,
+        randomness: Bytes,
         leaf_index: u64,
         merkle_proof: Vec<BytesN<32>>,
     ) -> Result<(), ContractError> {
         payroll::PayrollContract::employee_claim(
             &env, payroll_id, dao_id, employee_id, token_address,
-            amount, leaf_index, merkle_proof,
+            amount, salary, randomness, leaf_index, merkle_proof,
         )
     }
 
@@ -244,8 +307,9 @@ impl TechTownPayroll {
         payroll_id: u64,
         dao_id: u64,
         admin: Address,
+        token_address: Address,
     ) -> Result<(), ContractError> {
-        payroll::PayrollContract::cancel_payroll(&env, payroll_id, dao_id, admin)
+        payroll::PayrollContract::cancel_payroll(&env, payroll_id, dao_id, admin, token_address)
     }
 
     pub fn get_payroll(env: Env, payroll_id: u64) -> Result<Payroll, ContractError> {
@@ -298,10 +362,35 @@ impl TechTownPayroll {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // ZK utility (callable off-chain via simulate, not via live transactions)
+    // Upgradeability
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Compute a salary commitment hash on-chain (useful for backend verification).
+    pub fn set_verifying_key(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        vk_bytes: Bytes,
+    ) -> Result<(), ContractError> {
+        upgrade::UpgradeContract::set_verifying_key(&env, dao_id, caller, vk_bytes)
+    }
+
+    pub fn get_verifying_key(env: Env) -> Option<VerifyingKey> {
+        upgrade::UpgradeContract::get_verifying_key(&env)
+    }
+
+    pub fn upgrade_contract(
+        env: Env,
+        dao_id: u64,
+        caller: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        upgrade::UpgradeContract::upgrade_contract(&env, dao_id, caller, new_wasm_hash)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZK utilities
+    // ─────────────────────────────────────────────────────────────────────────
+
     pub fn compute_commitment(
         env: Env,
         employee_id: u64,

@@ -1,46 +1,58 @@
-use soroban_sdk::{contracttype, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 use crate::types::*;
 use crate::errors::ContractError;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage Keys
-//
-// Using a #[contracttype] enum as the key type is the idiomatic Soroban
-// pattern. Each variant encodes both the entity type and its ID(s), so every
-// record gets a unique, compact, deterministic key — no format! needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    // Counters
+    // ── Counters ─────────────────────────────────────────────────────────────
     DaoCounter,
     EmployeeCounter,
     PayrollCounter,
     ProposalCounter,
-    // Entities
+
+    // ── Core entities ────────────────────────────────────────────────────────
     Dao(u64),
     Employee(u64, u64),         // (dao_id, employee_id)
     Payroll(u64),               // payroll_id
     Commitment(u64, u64),       // (dao_id, employee_id)
     Proposal(u64, u64),         // (dao_id, proposal_id)
-    // Per-payroll claim tracking
-    Claimed(u64, u64),          // (payroll_id, employee_id) → bool
-    // Treasury balances
-    TreasuryBalance(u64, u64),  // (dao_id, token_sym) — see note below
-    LockedBalance(u64, u64),    // (payroll_id, token_sym)
-    // Employee count per DAO (used for iteration)
-    DaoEmployeeCount(u64),
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Note on token keys:
-//   Soroban Address is not a primitive, so we can't use it directly in an
-//   enum variant that must derive contracttype without it also being
-//   contracttype. Instead, callers pass a u64 "token slot" index managed by
-//   the treasury — see treasury.rs. The treasury maps (dao_id, token_address)
-//   to a slot integer stored in TreasuryBalance(dao_id, slot).
-// ─────────────────────────────────────────────────────────────────────────────
+    // ── Roles / members ──────────────────────────────────────────────────────
+    Member(u64, u64),           // (dao_id, member_index) → Member
+    MemberIndex(u64),           // dao_id → member count (for iteration)
+    MemberByAddr(u64, Address), // (dao_id, address) → member_index  (reverse lookup)
+
+    // ── Token whitelist ──────────────────────────────────────────────────────
+    /// (dao_id, token_slot) → bool — true means the token is whitelisted
+    TokenWhitelisted(u64, u64),
+    /// dao_id → count of whitelisted tokens
+    TokenCount(u64),
+
+    // ── Treasury balances ────────────────────────────────────────────────────
+    /// (dao_id, token_slot) → i128 available balance
+    TreasuryBalance(u64, u64),
+    /// (payroll_id, token_slot) → i128 locked balance
+    LockedBalance(u64, u64),
+
+    // ── Period double-pay guard ──────────────────────────────────────────────
+    /// (dao_id, employee_id, period) → bool — true = already paid this period
+    PeriodPaid(u64, u64, u64),
+
+    // ── Per-payroll claim tracking ───────────────────────────────────────────
+    /// (payroll_id, employee_id) → bool
+    Claimed(u64, u64),
+
+    // ── Employee count per DAO (iteration) ───────────────────────────────────
+    DaoEmployeeCount(u64),
+
+    // ── ZK verifying key ─────────────────────────────────────────────────────
+    VerifyingKey,
+}
 
 pub struct Storage;
 
@@ -88,17 +100,109 @@ impl Storage {
             .ok_or(ContractError::DAONotFound)
     }
 
+    // ── Roles / Members ──────────────────────────────────────────────────────
+
+    pub fn add_member(env: &Env, dao_id: u64, member: &Member) {
+        let idx_key = DataKey::MemberIndex(dao_id);
+        let idx: u64 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Member(dao_id, idx), member);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MemberByAddr(dao_id, member.address.clone()), &idx);
+        env.storage().persistent().set(&idx_key, &(idx + 1));
+    }
+
+    pub fn get_member(env: &Env, dao_id: u64, addr: &Address) -> Option<Member> {
+        let idx: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MemberByAddr(dao_id, addr.clone()))?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::Member(dao_id, idx))
+    }
+
+    pub fn update_member(env: &Env, dao_id: u64, member: &Member) {
+        if let Some(idx) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MemberByAddr(dao_id, member.address.clone()))
+        {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Member(dao_id, idx), member);
+        }
+    }
+
+    pub fn remove_member(env: &Env, dao_id: u64, addr: &Address) {
+        if let Some(idx) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MemberByAddr(dao_id, addr.clone()))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Member(dao_id, idx));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::MemberByAddr(dao_id, addr.clone()));
+        }
+    }
+
+    pub fn get_all_members(env: &Env, dao_id: u64) -> Vec<Member> {
+        let mut members = Vec::new(env);
+        let max: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MemberIndex(dao_id))
+            .unwrap_or(0);
+        for i in 0..max {
+            if let Some(m) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Member>(&DataKey::Member(dao_id, i))
+            {
+                members.push_back(m);
+            }
+        }
+        members
+    }
+
+    // ── Token Whitelist ───────────────────────────────────────────────────────
+
+    pub fn whitelist_token(env: &Env, dao_id: u64, token_slot: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenWhitelisted(dao_id, token_slot), &true);
+    }
+
+    pub fn remove_whitelisted_token(env: &Env, dao_id: u64, token_slot: u64) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenWhitelisted(dao_id, token_slot));
+    }
+
+    pub fn is_token_whitelisted(env: &Env, dao_id: u64, token_slot: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenWhitelisted(dao_id, token_slot))
+            .unwrap_or(false)
+    }
+
     // ── Employee ─────────────────────────────────────────────────────────────
 
     pub fn save_employee(env: &Env, dao_id: u64, employee: &Employee) {
         env.storage()
             .persistent()
             .set(&DataKey::Employee(dao_id, employee.id), employee);
-        // Track max employee id for iteration
         let count_key = DataKey::DaoEmployeeCount(dao_id);
         let current: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if employee.id >= current {
-            env.storage().persistent().set(&count_key, &(employee.id + 1));
+            env.storage()
+                .persistent()
+                .set(&count_key, &(employee.id + 1));
         }
     }
 
@@ -111,8 +215,11 @@ impl Storage {
 
     pub fn get_all_employees(env: &Env, dao_id: u64) -> Vec<Employee> {
         let mut employees = Vec::new(env);
-        let count_key = DataKey::DaoEmployeeCount(dao_id);
-        let max: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let max: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DaoEmployeeCount(dao_id))
+            .unwrap_or(0);
         for id in 0..max {
             if let Some(emp) = env
                 .storage()
@@ -170,6 +277,21 @@ impl Storage {
             .ok_or(ContractError::ProposalNotFound)
     }
 
+    // ── Period double-pay guard ───────────────────────────────────────────────
+
+    pub fn mark_period_paid(env: &Env, dao_id: u64, employee_id: u64, period: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::PeriodPaid(dao_id, employee_id, period), &true);
+    }
+
+    pub fn is_period_paid(env: &Env, dao_id: u64, employee_id: u64, period: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::PeriodPaid(dao_id, employee_id, period))
+            .unwrap_or(false)
+    }
+
     // ── Claim tracking ───────────────────────────────────────────────────────
 
     pub fn mark_claimed(env: &Env, payroll_id: u64, employee_id: u64) {
@@ -185,10 +307,7 @@ impl Storage {
             .unwrap_or(false)
     }
 
-    // ── Treasury balances ────────────────────────────────────────────────────
-    //
-    // token_slot: a u64 that uniquely identifies (dao_id, token_address).
-    // The treasury module derives it deterministically from the token address.
+    // ── Treasury balances ─────────────────────────────────────────────────────
 
     pub fn get_treasury_balance(env: &Env, dao_id: u64, token_slot: u64) -> i128 {
         env.storage()
@@ -214,5 +333,19 @@ impl Storage {
         env.storage()
             .persistent()
             .set(&DataKey::LockedBalance(payroll_id, token_slot), &amount);
+    }
+
+    // ── ZK Verifying Key ─────────────────────────────────────────────────────
+
+    pub fn set_verifying_key(env: &Env, vk: &VerifyingKey) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifyingKey, vk);
+    }
+
+    pub fn get_verifying_key(env: &Env) -> Option<VerifyingKey> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifyingKey)
     }
 }

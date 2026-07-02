@@ -34,6 +34,7 @@ impl EmployeeContract {
             commitment_hash,
             joined_at: env.ledger().timestamp(),
             last_payroll: 0,
+            last_paid_period: 0,
         };
 
         // Store the commitment alongside the employee

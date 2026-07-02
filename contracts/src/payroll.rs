@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Vec};
 use crate::types::{EmployeeStatus, Payroll, PayrollStatus, SalaryCommitment, ZKProof};
 use crate::storage::Storage;
 use crate::errors::ContractError;
@@ -6,15 +6,23 @@ use crate::event::Events;
 use crate::treasury::TreasuryContract;
 use crate::zk_verifier::ZKVerifier;
 use crate::dao::DAOContract;
+use crate::types::Role;
 
 pub struct PayrollContract;
 
 impl PayrollContract {
-    /// Create a new payroll for the given period.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Create
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Create a new payroll proposal for a given period.
     ///
-    /// `commitments`  – one entry per employee with their salary commitment hash.
-    ///                  Amount is revealed only at execution time via ZK proof.
-    /// `merkle_root`  – root of the Merkle tree of (employee_id, commitment_hash) leaves.
+    /// - `period`       – payroll period identifier (e.g. YYYYMM as u64).
+    /// - `employees`    – ordered list of employee IDs included in this payroll.
+    /// - `commitments`  – matching commitment records (same order as employees).
+    /// - `total_amount` – sum of all salaries, confirmed later by ZK proof.
+    /// - `merkle_root`  – root of the Merkle tree of (employee_id ‖ amount) leaves.
+    /// - `token_address`– the payment token (must be whitelisted).
     pub fn create_payroll(
         env: &Env,
         dao_id: u64,
@@ -24,31 +32,38 @@ impl PayrollContract {
         commitments: Vec<SalaryCommitment>,
         total_amount: i128,
         merkle_root: BytesN<32>,
+        token_address: Address,
     ) -> Result<u64, ContractError> {
         admin.require_auth();
-        DAOContract::require_admin(env, dao_id, &admin)?;
+        DAOContract::require_role(env, dao_id, &admin, &Role::Admin)?;
 
         if employees.len() != commitments.len() {
             return Err(ContractError::InvalidAmount);
         }
-
         if total_amount <= 0 {
             return Err(ContractError::InvalidAmount);
         }
 
-        let payroll_id = Storage::next_payroll_id(env);
-
-        // Persist each employee's commitment for this payroll period
+        // Validate every employee and check for double-pay this period
         for i in 0..employees.len() {
             let emp_id = employees.get(i).unwrap();
-            let commitment = commitments.get(i).unwrap();
-            // Ensure the employee exists and is active
             let emp = Storage::get_employee(env, dao_id, emp_id)?;
+
             if emp.status != EmployeeStatus::Active {
                 return Err(ContractError::EmployeeNotActive);
             }
+
+            // ── Period double-pay guard ───────────────────────────────────
+            if Storage::is_period_paid(env, dao_id, emp_id, period) {
+                return Err(ContractError::AlreadyPaidThisPeriod);
+            }
+
+            let commitment = commitments.get(i).unwrap();
             Storage::save_commitment(env, dao_id, emp_id, &commitment);
         }
+
+        let slot = TreasuryContract::token_slot(env, &token_address);
+        let payroll_id = Storage::next_payroll_id(env);
 
         let payroll = Payroll {
             id: payroll_id,
@@ -58,6 +73,7 @@ impl PayrollContract {
             employee_count: employees.len() as u32,
             status: PayrollStatus::Pending,
             merkle_root,
+            token_slot: slot,
             created_at: env.ledger().timestamp(),
             approved_at: 0,
             executed_at: 0,
@@ -68,7 +84,11 @@ impl PayrollContract {
         Ok(payroll_id)
     }
 
-    /// Approve a pending payroll. Only the DAO admin may approve.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Approve
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Approve a pending payroll. Requires Admin role.
     pub fn approve_payroll(
         env: &Env,
         payroll_id: u64,
@@ -76,7 +96,7 @@ impl PayrollContract {
         approver: Address,
     ) -> Result<(), ContractError> {
         approver.require_auth();
-        DAOContract::require_admin(env, dao_id, &approver)?;
+        DAOContract::require_role(env, dao_id, &approver, &Role::Admin)?;
 
         let mut payroll = Storage::get_payroll(env, payroll_id)?;
 
@@ -92,18 +112,16 @@ impl PayrollContract {
         Ok(())
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Execute
+    // ─────────────────────────────────────────────────────────────────────────
+
     /// Execute an approved payroll.
     ///
-    /// Design:
-    ///   1. Verify the ZK proof (proves all salaries are valid and sum == total_amount).
-    ///   2. Lock `total_amount` from the treasury into the payroll escrow.
-    ///   3. Mark the payroll as Executed — individual employees then claim their
-    ///      portion via `employee_claim`.
-    ///
-    /// This separation means:
-    ///   - Funds are locked atomically in one transaction.
-    ///   - Each employee claims their own amount in a separate, independent tx.
-    ///   - No double-withdraw: locking and claiming are distinct operations.
+    /// Flow:
+    ///   1. Verify the ZK proof against the payroll's public parameters.
+    ///   2. Lock `total_amount` from the treasury into a per-payroll escrow.
+    ///   3. Mark the payroll Executed — employees then claim individually.
     pub fn execute_payroll(
         env: &Env,
         payroll_id: u64,
@@ -111,8 +129,6 @@ impl PayrollContract {
         token_address: Address,
         zk_proof: ZKProof,
     ) -> Result<(), ContractError> {
-        // No auth required here: anyone may call execute once the proof is ready,
-        // but the ZK proof itself provides the cryptographic authorization.
         DAOContract::require_active(env, dao_id)?;
 
         let mut payroll = Storage::get_payroll(env, payroll_id)?;
@@ -120,24 +136,28 @@ impl PayrollContract {
         if payroll.dao_id != dao_id {
             return Err(ContractError::Unauthorized);
         }
-
         if payroll.status != PayrollStatus::Approved {
             return Err(ContractError::PayrollInvalidStatus);
         }
 
-        // ── Verify ZK proof ────────────────────────────────────────────────
-        let valid = ZKVerifier::verify_payroll_proof(
+        // Verify token matches what was used at creation
+        let expected_slot = TreasuryContract::token_slot(env, &token_address);
+        if payroll.token_slot != expected_slot {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Verify ZK proof
+        if !ZKVerifier::verify_payroll_proof(
             env,
             &zk_proof,
             payroll.total_amount,
             payroll.employee_count,
             &payroll.merkle_root,
-        );
-        if !valid {
+        ) {
             return Err(ContractError::InvalidProof);
         }
 
-        // ── Lock the full payroll budget in escrow ─────────────────────────
+        // Lock the full budget atomically
         TreasuryContract::lock_budget(
             env,
             dao_id,
@@ -154,14 +174,21 @@ impl PayrollContract {
         Ok(())
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Employee Claim
+    // ─────────────────────────────────────────────────────────────────────────
+
     /// Employee claims their salary for an executed payroll.
     ///
-    /// `amount` and `merkle_proof` are provided by the employee (or relayer)
-    /// off-chain. The contract verifies:
-    ///   1. The payroll is in Executed state.
-    ///   2. The employee is active and has not already claimed.
-    ///   3. The (employee_id, amount) leaf is in the payroll Merkle tree.
-    ///   4. `amount` matches the stored commitment hash (salary commitment check).
+    /// Checks (in order):
+    ///   1. Payroll is Executed.
+    ///   2. Employee has not already claimed.
+    ///   3. Employee is Active (not Frozen / Removed).
+    ///   4. Employee's wallet signs the transaction.
+    ///   5. Salary commitment verification: H(salary ‖ randomness ‖ employee_id)
+    ///      matches the on-chain commitment hash.
+    ///   6. Merkle inclusion proof: (employee_id ‖ amount) leaf is in the payroll tree.
+    ///   7. Period double-pay guard: this period is not already marked paid.
     pub fn employee_claim(
         env: &Env,
         payroll_id: u64,
@@ -169,6 +196,8 @@ impl PayrollContract {
         employee_id: u64,
         token_address: Address,
         amount: i128,
+        salary: i128,
+        randomness: Bytes,
         leaf_index: u64,
         merkle_proof: Vec<BytesN<32>>,
     ) -> Result<(), ContractError> {
@@ -178,14 +207,12 @@ impl PayrollContract {
             return Err(ContractError::PayrollInvalidStatus);
         }
 
-        // Prevent double-claim
+        // Double-claim guard
         if Storage::is_claimed(env, payroll_id, employee_id) {
             return Err(ContractError::AlreadyClaimed);
         }
 
         let employee = Storage::get_employee(env, dao_id, employee_id)?;
-
-        // Auth: the employee's registered wallet must sign
         employee.wallet.require_auth();
 
         if employee.status == EmployeeStatus::Frozen {
@@ -199,21 +226,37 @@ impl PayrollContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        // ── Verify Merkle inclusion of (employee_id, amount) ──────────────
-        // Leaf = SHA-256(employee_id || amount)
+        // ── Salary commitment verification ────────────────────────────────
+        // Proves the employee knows their salary without revealing it on-chain.
+        let commitment = Storage::get_commitment(env, dao_id, employee_id)?;
+        if !ZKVerifier::verify_salary_commitment(
+            env,
+            &commitment.commitment_hash,
+            employee_id,
+            salary,
+            &randomness,
+        ) {
+            return Err(ContractError::InvalidCommitment);
+        }
+
+        // ── Merkle inclusion proof ────────────────────────────────────────
         let leaf = Self::compute_claim_leaf(env, employee_id, amount);
-        let proof_valid = ZKVerifier::verify_merkle_proof(
+        if !ZKVerifier::verify_merkle_proof(
             env,
             &leaf,
             &merkle_proof,
             leaf_index,
             &payroll.merkle_root,
-        );
-        if !proof_valid {
+        ) {
             return Err(ContractError::InvalidMerkleProof);
         }
 
-        // ── Pay the employee from locked funds ─────────────────────────────
+        // ── Period double-pay guard ───────────────────────────────────────
+        if Storage::is_period_paid(env, dao_id, employee_id, payroll.period) {
+            return Err(ContractError::AlreadyPaidThisPeriod);
+        }
+
+        // ── Pay ───────────────────────────────────────────────────────────
         TreasuryContract::pay_employee(
             env,
             payroll_id,
@@ -222,30 +265,60 @@ impl PayrollContract {
             amount,
         )?;
 
-        // Mark claimed and update last_payroll
+        // Mark claimed + update employee state
         Storage::mark_claimed(env, payroll_id, employee_id);
+        Storage::mark_period_paid(env, dao_id, employee_id, payroll.period);
+
         let mut emp = employee;
         emp.last_payroll = payroll_id;
+        emp.last_paid_period = payroll.period;
         Storage::save_employee(env, dao_id, &emp);
 
         Events::salary_claimed(env, payroll_id, employee_id, amount);
         Ok(())
     }
 
-    /// Cancel a pending payroll (before it is approved).
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cancel
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Cancel a payroll. Requires Admin role.
+    ///
+    /// - Pending → Cancelled immediately, no funds to release.
+    /// - Approved → Cancelled AND locked budget is released back to treasury.
+    /// - Executed / Cancelled → error.
     pub fn cancel_payroll(
         env: &Env,
         payroll_id: u64,
         dao_id: u64,
         admin: Address,
+        token_address: Address,
     ) -> Result<(), ContractError> {
         admin.require_auth();
-        DAOContract::require_admin(env, dao_id, &admin)?;
+        DAOContract::require_role(env, dao_id, &admin, &Role::Admin)?;
 
         let mut payroll = Storage::get_payroll(env, payroll_id)?;
 
-        if payroll.status != PayrollStatus::Pending {
-            return Err(ContractError::PayrollInvalidStatus);
+        match payroll.status {
+            PayrollStatus::Pending => {
+                // Nothing locked yet — just cancel
+            }
+            PayrollStatus::Approved => {
+                // Budget was NOT locked yet (locking happens at execute), just cancel
+                // If somehow partial lock occurred, release it
+                let slot = TreasuryContract::token_slot(env, &token_address);
+                let locked = Storage::get_locked_balance(env, payroll_id, slot);
+                if locked > 0 {
+                    TreasuryContract::release_budget(
+                        env,
+                        dao_id,
+                        &token_address,
+                        payroll_id,
+                        locked,
+                    )?;
+                }
+            }
+            _ => return Err(ContractError::PayrollInvalidStatus),
         }
 
         payroll.status = PayrollStatus::Cancelled;
@@ -255,22 +328,25 @@ impl PayrollContract {
         Ok(())
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Queries
+    // ─────────────────────────────────────────────────────────────────────────
+
     pub fn get_payroll(env: &Env, payroll_id: u64) -> Result<Payroll, ContractError> {
         Storage::get_payroll(env, payroll_id)
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal helpers
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Compute the Merkle leaf for a claim: SHA-256(employee_id_be || amount_be)
+    /// Leaf = SHA-256(employee_id_be8 ‖ amount_be16)
     fn compute_claim_leaf(env: &Env, employee_id: u64, amount: i128) -> BytesN<32> {
-        use soroban_sdk::Bytes;
         let mut preimage = Bytes::new(env);
-        let id_bytes = employee_id.to_be_bytes();
-        for b in id_bytes.iter() {
+        for b in employee_id.to_be_bytes().iter() {
             preimage.push_back(*b);
         }
-        let amount_bytes = amount.to_be_bytes();
-        for b in amount_bytes.iter() {
+        for b in amount.to_be_bytes().iter() {
             preimage.push_back(*b);
         }
         env.crypto().sha256(&preimage).into()

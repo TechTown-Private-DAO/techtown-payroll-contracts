@@ -1,0 +1,45 @@
+# ── Rust ─────────────────────────────────────────────────────────────────────
+/target
+**/*.rs.bk
+Cargo.lock        # remove this line if you want to pin dependencies (recommended for binaries)
+
+# ── Soroban / Stellar ────────────────────────────────────────────────────────
+.soroban
+.stellar
+*.wasm            # compiled contract artifacts — regenerate with cargo build --release
+*.wat
+
+# ── Secrets / Keys ───────────────────────────────────────────────────────────
+*.pem
+*.key
+*.secret
+.env
+.env.*
+!.env.example     # keep the example file
+identity.json
+secret_key*
+
+# ── Test snapshots (Soroban testutils) ───────────────────────────────────────
+test_snapshots/
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Node (if frontend is added to this repo later) ───────────────────────────
+node_modules/
+.next/
+.turbo/
+dist/
